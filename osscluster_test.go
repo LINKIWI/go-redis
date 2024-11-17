@@ -1249,6 +1249,140 @@ var _ = Describe("ClusterClient", func() {
 		assertClusterClient()
 	})
 
+	Describe("ClusterClient with ReadOnly and ClusterSlots (> 2 total slaves, > 0 failing slaves)", func() {
+		BeforeEach(func() {
+			opt = redisClusterOptions()
+			opt.ReadOnly = true
+			opt.ClusterSlots = func(ctx context.Context) ([]redis.ClusterSlot, error) {
+				slots := []redis.ClusterSlot{{
+					Start: 0,
+					End:   4999,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":8220",
+					}, {
+						Addr: ":8223",
+					}, {
+						Addr: ":8226", // No such slave node
+					}, {
+						Addr: ":8229", // No such slave node
+					}},
+				}, {
+					Start: 5000,
+					End:   9999,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":8221",
+					}, {
+						Addr: ":8224",
+					}, {
+						Addr: ":8227", // No such slave node
+					}, {
+						Addr: ":8230", // No such slave node
+					}},
+				}, {
+					Start: 10000,
+					End:   16383,
+					Nodes: []redis.ClusterNode{{
+						Addr: ":8222",
+					}, {
+						Addr: ":8225",
+					}, {
+						Addr: ":8228", // No such slave node
+					}, {
+						Addr: ":8231", // No such slave node
+					}},
+				}}
+				return slots, nil
+			}
+			client = cluster.newClusterClient(ctx, opt)
+
+			err := client.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
+				return master.FlushDB(ctx).Err()
+			})
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		AfterEach(func() {
+			_ = client.ForEachMaster(ctx, func(ctx context.Context, master *redis.Client) error {
+				return master.FlushDB(ctx).Err()
+			})
+			Expect(client.Close()).NotTo(HaveOccurred())
+		})
+
+		It("uniformly randomly selects among all available slaves", func() {
+			var mu sync.Mutex
+
+			countCmdCalls := func(
+				name string,
+				category string,
+				calls map[string]int,
+			) func(ctx context.Context, client *redis.Client) error {
+				return func(ctx context.Context, client *redis.Client) error {
+					addr := client.Options().Addr
+
+					mu.Lock()
+					calls[addr] = 0
+					mu.Unlock()
+
+					info, err := client.InfoMap(ctx, "commandstats").Result()
+					if err != nil {
+						// Some slaves are failing, so this is intended to error on some addresses.
+						return nil
+					}
+
+					allStats, ok := info["Commandstats"]
+					if !ok {
+						return nil
+					}
+
+					cmdStats, ok := allStats["cmdstat_"+name]
+					if !ok {
+						return nil
+					}
+
+					for _, stat := range strings.Split(cmdStats, ",") {
+						if strings.HasPrefix(stat, category+"=") {
+							n, err := strconv.Atoi(stat[len(category+"="):])
+							if err != nil {
+								return err
+							}
+
+							mu.Lock()
+							calls[addr] += n
+							mu.Unlock()
+
+							return nil
+						}
+					}
+
+					return nil
+				}
+			}
+
+			initialSlaveGets := make(map[string]int)
+			err := client.ForEachSlave(ctx, countCmdCalls("get", "rejected_calls", initialSlaveGets))
+			Expect(err).NotTo(HaveOccurred())
+
+			for i := 0; i < 100; i++ {
+				err = client.Get(ctx, "readonly_clusterslots_multislave_test_"+strconv.Itoa(i)).Err()
+				Expect(err).To(Equal(redis.Nil))
+			}
+
+			afterSlaveGets := make(map[string]int)
+			err = client.ForEachSlave(ctx, countCmdCalls("get", "rejected_calls", afterSlaveGets))
+			Expect(err).NotTo(HaveOccurred())
+
+			// Failing slaves
+			for _, addr := range []string{":8226", ":8227", ":8228", ":8229", ":8230", ":8231"} {
+				Expect(afterSlaveGets[addr]).To(Equal(0))
+			}
+
+			// Healthy slaves
+			for _, addr := range []string{":8223", ":8224", ":8225"} {
+				Expect(afterSlaveGets[addr]).To(BeNumerically(">", initialSlaveGets[addr]))
+			}
+		})
+	})
+
 	Describe("ClusterClient with ClusterSlots with multiple nodes per slot", func() {
 		BeforeEach(func() {
 			failover = true

@@ -706,18 +706,81 @@ func (c *clusterState) slotMasterNode(slot int) (*clusterNode, error) {
 
 func (c *clusterState) slotSlaveNode(slot int) (*clusterNode, error) {
 	nodes := c.slotNodes(slot)
-	switch len(nodes) {
-	case 0:
+
+	switch {
+	// No nodes correspond to the target slot. This implies a hole in the slot mapping; fail
+	// gracefully by selecting a random node.
+	case len(nodes) == 0:
 		return c.nodes.Random()
-	case 1:
+
+	// Slot has no slaves.
+	case len(nodes) == 1:
 		return nodes[0], nil
-	case 2:
+
+	// Optimization: slot has exactly 1 slave; use it as long as it is not failing.
+	case len(nodes) == 2:
 		if slave := nodes[1]; !slave.Failing() {
 			return slave, nil
 		}
+
 		return nodes[0], nil
+
+	// Slot has more than 1 slave. Uniformly randomly select a slave, exhaustively considering all
+	// available slaves until a non-failing one is found.
+	case len(nodes) <= 16:
+		nSlaves := len(nodes) - 1
+		// Efficient data structure for tracking healthy (non-failing) slaves. A 1 bit indicates a
+		// healthy slave; a 0 bit indicates a failing slave.
+		//
+		// This comes at the cost of an O(n) traversal for selecting a healthy slave, but is still
+		// more CPU-efficient in the general case due to not requiring any heap memory allocation,
+		// considering the finite search space (16 bits).
+		//
+		// Note that the bitmask is initialized to 1, which enables this algorithm to be more
+		// efficient for the typical case in which more slaves are healthy than failing.
+		bitmask := (uint16(1) << nSlaves) - 1
+
+		// Continue random selection until a healthy slave is identified, or all slaves have been
+		// marked as failing.
+		for bitmask != 0 {
+			nHealthy := 0
+			for i := 0; i < nSlaves; i++ {
+				if (bitmask>>i)&1 == 1 {
+					nHealthy++
+				}
+			}
+
+			target := rand.Intn(nHealthy)
+			slave := -1
+
+			for i := 0; i < nSlaves; i++ {
+				if (bitmask>>i)&1 == 1 {
+					if target == 0 {
+						slave = i + 1
+						break
+					}
+
+					target--
+				}
+			}
+
+			if s := nodes[slave]; !s.Failing() {
+				return s, nil
+			}
+
+			bitmask &^= 1 << (slave - 1) // Mark slave as ineligible for use.
+		}
+
+		// All slaves are failing; fall back to master.
+		return nodes[0], nil
+
+	// The above optimized algorithm does not support uniform random selection among more than 16
+	// slaves, as this is an uncommon topology. In this scenario, exercise a simpler algorithm that
+	// makes a finite number of attempts at selecting a random healthy slave. This simple algorithm
+	// is not guaranteed to be exhaustive.
 	default:
 		var slave *clusterNode
+
 		for i := 0; i < 10; i++ {
 			n := rand.Intn(len(nodes)-1) + 1
 			slave = nodes[n]
@@ -726,7 +789,7 @@ func (c *clusterState) slotSlaveNode(slot int) (*clusterNode, error) {
 			}
 		}
 
-		// All slaves are loading - use master.
+		// All slaves are loading; fall back to master.
 		return nodes[0], nil
 	}
 }
